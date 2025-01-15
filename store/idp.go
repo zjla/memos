@@ -2,293 +2,195 @@ package store
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"strings"
 
-	"github.com/usememos/memos/common"
+	"github.com/pkg/errors"
+	"google.golang.org/protobuf/encoding/protojson"
+
+	storepb "github.com/usememos/memos/proto/gen/store"
 )
 
-type IdentityProviderType string
-
-const (
-	IdentityProviderOAuth2 IdentityProviderType = "OAUTH2"
-)
-
-type IdentityProviderConfig struct {
-	OAuth2Config *IdentityProviderOAuth2Config
-}
-
-type IdentityProviderOAuth2Config struct {
-	ClientID     string        `json:"clientId"`
-	ClientSecret string        `json:"clientSecret"`
-	AuthURL      string        `json:"authUrl"`
-	TokenURL     string        `json:"tokenUrl"`
-	UserInfoURL  string        `json:"userInfoUrl"`
-	Scopes       []string      `json:"scopes"`
-	FieldMapping *FieldMapping `json:"fieldMapping"`
-}
-
-type FieldMapping struct {
-	Identifier  string `json:"identifier"`
-	DisplayName string `json:"displayName"`
-	Email       string `json:"email"`
-}
-
-type IdentityProviderMessage struct {
-	ID               int
+type IdentityProvider struct {
+	ID               int32
 	Name             string
-	Type             IdentityProviderType
+	Type             storepb.IdentityProvider_Type
 	IdentifierFilter string
-	Config           *IdentityProviderConfig
+	Config           string
 }
 
-type FindIdentityProviderMessage struct {
-	ID *int
+type FindIdentityProvider struct {
+	ID *int32
 }
 
-type UpdateIdentityProviderMessage struct {
-	ID               int
-	Type             IdentityProviderType
+type UpdateIdentityProvider struct {
+	ID               int32
 	Name             *string
 	IdentifierFilter *string
-	Config           *IdentityProviderConfig
+	Config           *string
 }
 
-type DeleteIdentityProviderMessage struct {
-	ID int
+type DeleteIdentityProvider struct {
+	ID int32
 }
 
-func (s *Store) CreateIdentityProvider(ctx context.Context, create *IdentityProviderMessage) (*IdentityProviderMessage, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+func (s *Store) CreateIdentityProvider(ctx context.Context, create *storepb.IdentityProvider) (*storepb.IdentityProvider, error) {
+	raw, err := convertIdentityProviderToRaw(create)
 	if err != nil {
-		return nil, FormatError(err)
+		return nil, err
 	}
-	defer tx.Rollback()
-
-	var configBytes []byte
-	if create.Type == IdentityProviderOAuth2 {
-		configBytes, err = json.Marshal(create.Config.OAuth2Config)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		return nil, fmt.Errorf("unsupported idp type %s", string(create.Type))
-	}
-	query := `
-		INSERT INTO idp (
-			name,
-			type,
-			identifier_filter,
-			config
-		)
-		VALUES (?, ?, ?, ?)
-		RETURNING id
-	`
-	if err := tx.QueryRowContext(
-		ctx,
-		query,
-		create.Name,
-		create.Type,
-		create.IdentifierFilter,
-		string(configBytes),
-	).Scan(
-		&create.ID,
-	); err != nil {
-		return nil, FormatError(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, FormatError(err)
-	}
-	identityProviderMessage := create
-	s.idpCache.Store(identityProviderMessage.ID, identityProviderMessage)
-	return identityProviderMessage, nil
-}
-
-func (s *Store) ListIdentityProviders(ctx context.Context, find *FindIdentityProviderMessage) ([]*IdentityProviderMessage, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, FormatError(err)
-	}
-	defer tx.Rollback()
-
-	list, err := listIdentityProviders(ctx, tx, find)
+	identityProviderRaw, err := s.driver.CreateIdentityProvider(ctx, raw)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, item := range list {
-		s.idpCache.Store(item.ID, item)
+	identityProvider, err := convertIdentityProviderFromRaw(identityProviderRaw)
+	if err != nil {
+		return nil, err
 	}
-	return list, nil
+	s.idpCache.Store(identityProvider.Id, identityProvider)
+	return identityProvider, nil
 }
 
-func (s *Store) GetIdentityProvider(ctx context.Context, find *FindIdentityProviderMessage) (*IdentityProviderMessage, error) {
+func (s *Store) ListIdentityProviders(ctx context.Context, find *FindIdentityProvider) ([]*storepb.IdentityProvider, error) {
+	list, err := s.driver.ListIdentityProviders(ctx, find)
+	if err != nil {
+		return nil, err
+	}
+
+	identityProviders := []*storepb.IdentityProvider{}
+	for _, raw := range list {
+		identityProvider, err := convertIdentityProviderFromRaw(raw)
+		if err != nil {
+			return nil, err
+		}
+		identityProviders = append(identityProviders, identityProvider)
+		s.idpCache.Store(identityProvider.Id, identityProvider)
+	}
+	return identityProviders, nil
+}
+
+func (s *Store) GetIdentityProvider(ctx context.Context, find *FindIdentityProvider) (*storepb.IdentityProvider, error) {
 	if find.ID != nil {
 		if cache, ok := s.idpCache.Load(*find.ID); ok {
-			return cache.(*IdentityProviderMessage), nil
+			identityProvider, ok := cache.(*storepb.IdentityProvider)
+			if ok {
+				return identityProvider, nil
+			}
 		}
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, FormatError(err)
-	}
-	defer tx.Rollback()
-
-	list, err := listIdentityProviders(ctx, tx, find)
+	list, err := s.ListIdentityProviders(ctx, find)
 	if err != nil {
 		return nil, err
 	}
 	if len(list) == 0 {
-		return nil, &common.Error{Code: common.NotFound, Err: fmt.Errorf("not found")}
+		return nil, nil
+	}
+	if len(list) > 1 {
+		return nil, errors.Errorf("Found multiple identity providers with ID %d", *find.ID)
 	}
 
-	identityProviderMessage := list[0]
-	s.idpCache.Store(identityProviderMessage.ID, identityProviderMessage)
-	return identityProviderMessage, nil
+	identityProvider := list[0]
+	return identityProvider, nil
 }
 
-func (s *Store) UpdateIdentityProvider(ctx context.Context, update *UpdateIdentityProviderMessage) (*IdentityProviderMessage, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, FormatError(err)
-	}
-	defer tx.Rollback()
+type UpdateIdentityProviderV1 struct {
+	ID               int32
+	Type             storepb.IdentityProvider_Type
+	Name             *string
+	IdentifierFilter *string
+	Config           *storepb.IdentityProviderConfig
+}
 
-	set, args := []string{}, []interface{}{}
-	if v := update.Name; v != nil {
-		set, args = append(set, "name = ?"), append(args, *v)
+func (s *Store) UpdateIdentityProvider(ctx context.Context, update *UpdateIdentityProviderV1) (*storepb.IdentityProvider, error) {
+	updateRaw := &UpdateIdentityProvider{
+		ID: update.ID,
 	}
-	if v := update.IdentifierFilter; v != nil {
-		set, args = append(set, "identifier_filter = ?"), append(args, *v)
+	if update.Name != nil {
+		updateRaw.Name = update.Name
 	}
-	if v := update.Config; v != nil {
-		var configBytes []byte
-		if update.Type == IdentityProviderOAuth2 {
-			configBytes, err = json.Marshal(update.Config.OAuth2Config)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, fmt.Errorf("unsupported idp type %s", string(update.Type))
-		}
-		set, args = append(set, "config = ?"), append(args, string(configBytes))
+	if update.IdentifierFilter != nil {
+		updateRaw.IdentifierFilter = update.IdentifierFilter
 	}
-	args = append(args, update.ID)
-
-	query := `
-		UPDATE idp
-		SET ` + strings.Join(set, ", ") + `
-		WHERE id = ?
-		RETURNING id, name, type, identifier_filter, config
-	`
-	var identityProviderMessage IdentityProviderMessage
-	var identityProviderConfig string
-	if err := tx.QueryRowContext(ctx, query, args...).Scan(
-		&identityProviderMessage.ID,
-		&identityProviderMessage.Name,
-		&identityProviderMessage.Type,
-		&identityProviderMessage.IdentifierFilter,
-		&identityProviderConfig,
-	); err != nil {
-		return nil, FormatError(err)
-	}
-	if identityProviderMessage.Type == IdentityProviderOAuth2 {
-		oauth2Config := &IdentityProviderOAuth2Config{}
-		if err := json.Unmarshal([]byte(identityProviderConfig), oauth2Config); err != nil {
+	if update.Config != nil {
+		configRaw, err := convertIdentityProviderConfigToRaw(update.Type, update.Config)
+		if err != nil {
 			return nil, err
 		}
-		identityProviderMessage.Config = &IdentityProviderConfig{
-			OAuth2Config: oauth2Config,
-		}
-	} else {
-		return nil, fmt.Errorf("unsupported idp type %s", string(identityProviderMessage.Type))
+		updateRaw.Config = &configRaw
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, FormatError(err)
+	identityProviderRaw, err := s.driver.UpdateIdentityProvider(ctx, updateRaw)
+	if err != nil {
+		return nil, err
 	}
-	s.idpCache.Store(identityProviderMessage.ID, identityProviderMessage)
-	return &identityProviderMessage, nil
+
+	identityProvider, err := convertIdentityProviderFromRaw(identityProviderRaw)
+	if err != nil {
+		return nil, err
+	}
+	s.idpCache.Store(identityProvider.Id, identityProvider)
+	return identityProvider, nil
 }
 
-func (s *Store) DeleteIdentityProvider(ctx context.Context, delete *DeleteIdentityProviderMessage) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return FormatError(err)
-	}
-	defer tx.Rollback()
-
-	where, args := []string{"id = ?"}, []interface{}{delete.ID}
-	stmt := `DELETE FROM idp WHERE ` + strings.Join(where, " AND ")
-	result, err := tx.ExecContext(ctx, stmt, args...)
-	if err != nil {
-		return FormatError(err)
-	}
-
-	rows, err := result.RowsAffected()
+func (s *Store) DeleteIdentityProvider(ctx context.Context, delete *DeleteIdentityProvider) error {
+	err := s.driver.DeleteIdentityProvider(ctx, delete)
 	if err != nil {
 		return err
 	}
-	if rows == 0 {
-		return &common.Error{Code: common.NotFound, Err: fmt.Errorf("idp not found")}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
+
 	s.idpCache.Delete(delete.ID)
 	return nil
 }
 
-func listIdentityProviders(ctx context.Context, tx *sql.Tx, find *FindIdentityProviderMessage) ([]*IdentityProviderMessage, error) {
-	where, args := []string{"TRUE"}, []interface{}{}
-	if v := find.ID; v != nil {
-		where, args = append(where, fmt.Sprintf("id = $%d", len(args)+1)), append(args, *v)
+func convertIdentityProviderFromRaw(raw *IdentityProvider) (*storepb.IdentityProvider, error) {
+	identityProvider := &storepb.IdentityProvider{
+		Id:               raw.ID,
+		Name:             raw.Name,
+		Type:             raw.Type,
+		IdentifierFilter: raw.IdentifierFilter,
 	}
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT
-			id,
-			name,
-			type,
-			identifier_filter,
-			config
-		FROM idp
-		WHERE `+strings.Join(where, " AND ")+` ORDER BY id ASC`,
-		args...,
-	)
+	config, err := convertIdentityProviderConfigFromRaw(identityProvider.Type, raw.Config)
 	if err != nil {
-		return nil, FormatError(err)
+		return nil, err
 	}
-	defer rows.Close()
+	identityProvider.Config = config
+	return identityProvider, nil
+}
 
-	var identityProviderMessages []*IdentityProviderMessage
-	for rows.Next() {
-		var identityProviderMessage IdentityProviderMessage
-		var identityProviderConfig string
-		if err := rows.Scan(
-			&identityProviderMessage.ID,
-			&identityProviderMessage.Name,
-			&identityProviderMessage.Type,
-			&identityProviderMessage.IdentifierFilter,
-			&identityProviderConfig,
-		); err != nil {
-			return nil, FormatError(err)
-		}
-		if identityProviderMessage.Type == IdentityProviderOAuth2 {
-			oauth2Config := &IdentityProviderOAuth2Config{}
-			if err := json.Unmarshal([]byte(identityProviderConfig), oauth2Config); err != nil {
-				return nil, err
-			}
-			identityProviderMessage.Config = &IdentityProviderConfig{
-				OAuth2Config: oauth2Config,
-			}
-		} else {
-			return nil, fmt.Errorf("unsupported idp type %s", string(identityProviderMessage.Type))
-		}
-		identityProviderMessages = append(identityProviderMessages, &identityProviderMessage)
+func convertIdentityProviderToRaw(identityProvider *storepb.IdentityProvider) (*IdentityProvider, error) {
+	raw := &IdentityProvider{
+		ID:               identityProvider.Id,
+		Name:             identityProvider.Name,
+		Type:             identityProvider.Type,
+		IdentifierFilter: identityProvider.IdentifierFilter,
 	}
+	configRaw, err := convertIdentityProviderConfigToRaw(identityProvider.Type, identityProvider.Config)
+	if err != nil {
+		return nil, err
+	}
+	raw.Config = configRaw
+	return raw, nil
+}
 
-	return identityProviderMessages, nil
+func convertIdentityProviderConfigFromRaw(identityProviderType storepb.IdentityProvider_Type, raw string) (*storepb.IdentityProviderConfig, error) {
+	config := &storepb.IdentityProviderConfig{}
+	if identityProviderType == storepb.IdentityProvider_OAUTH2 {
+		oauth2Config := &storepb.OAuth2Config{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(raw), oauth2Config); err != nil {
+			return nil, errors.Wrap(err, "Failed to unmarshal OAuth2Config")
+		}
+		config.Config = &storepb.IdentityProviderConfig_Oauth2Config{Oauth2Config: oauth2Config}
+	}
+	return config, nil
+}
+
+func convertIdentityProviderConfigToRaw(identityProviderType storepb.IdentityProvider_Type, config *storepb.IdentityProviderConfig) (string, error) {
+	raw := ""
+	if identityProviderType == storepb.IdentityProvider_OAUTH2 {
+		bytes, err := protojson.Marshal(config.GetOauth2Config())
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to marshal OAuth2Config")
+		}
+		raw = string(bytes)
+	}
+	return raw, nil
 }

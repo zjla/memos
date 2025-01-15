@@ -2,66 +2,88 @@ package s3
 
 import (
 	"context"
-	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/usememos/memos/api"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/pkg/errors"
+
+	storepb "github.com/usememos/memos/proto/gen/store"
 )
 
 type Client struct {
-	Client     *awss3.Client
-	BucketName string
-	URLPrefix  string
+	Client *s3.Client
+	Bucket *string
 }
 
-func NewClient(ctx context.Context, storage *api.Storage) (*Client, error) {
-	resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL:           storage.EndPoint,
-			SigningRegion: storage.Region,
-		}, nil
-	})
-
+func NewClient(ctx context.Context, s3Config *storepb.StorageS3Config) (*Client, error) {
 	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithEndpointResolverWithOptions(resolver),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(storage.AccessKey, storage.SecretKey, "")),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(s3Config.AccessKeyId, s3Config.AccessKeySecret, "")),
+		config.WithRegion(s3Config.Region),
 	)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to load s3 config")
 	}
 
-	client := awss3.NewFromConfig(cfg)
-
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(s3Config.Endpoint)
+	})
 	return &Client{
-		Client:     client,
-		BucketName: storage.Bucket,
-		URLPrefix:  storage.URLPrefix,
+		Client: client,
+		Bucket: aws.String(s3Config.Bucket),
 	}, nil
 }
 
-func (client *Client) UploadFile(ctx context.Context, filename string, fileType string, src io.Reader, storage *api.Storage) (string, error) {
-	uploader := manager.NewUploader(client.Client)
-	resp, err := uploader.Upload(ctx, &awss3.PutObjectInput{
-		Bucket:      aws.String(client.BucketName),
-		Key:         aws.String(filename),
-		Body:        src,
+// UploadObject uploads an object to S3.
+func (c *Client) UploadObject(ctx context.Context, key string, fileType string, content io.Reader) (string, error) {
+	uploader := manager.NewUploader(c.Client)
+	putInput := s3.PutObjectInput{
+		Bucket:      c.Bucket,
+		Key:         aws.String(key),
 		ContentType: aws.String(fileType),
-		ACL:         types.ObjectCannedACL(*aws.String("public-read")),
-	})
+		Body:        content,
+	}
+	result, err := uploader.Upload(ctx, &putInput)
 	if err != nil {
 		return "", err
 	}
-	var link string
-	if storage.URLPrefix == "" {
-		link = resp.Location
-	} else {
-		link = fmt.Sprintf("%s/%s", storage.URLPrefix, filename)
+
+	resultKey := result.Key
+	if resultKey == nil || *resultKey == "" {
+		return "", errors.New("failed to get file key")
 	}
-	return link, nil
+	return *resultKey, nil
+}
+
+// PresignGetObject presigns an object in S3.
+func (c *Client) PresignGetObject(ctx context.Context, key string) (string, error) {
+	presignClient := s3.NewPresignClient(c.Client)
+	presignResult, err := presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(*c.Bucket),
+		Key:    aws.String(key),
+	}, func(opts *s3.PresignOptions) {
+		// Set the expiration time of the presigned URL to 5 days.
+		// Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+		opts.Expires = time.Duration(5 * 24 * time.Hour)
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to presign put object")
+	}
+	return presignResult.URL, nil
+}
+
+// DeleteObject deletes an object in S3.
+func (c *Client) DeleteObject(ctx context.Context, key string) error {
+	_, err := c.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: c.Bucket,
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to delete object")
+	}
+	return nil
 }
